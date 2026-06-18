@@ -1,0 +1,13 @@
+{
+  "name": "draft-pick-bot",
+  "version": "2.0.0",
+  "description": "Discord bot for leaving conditional draft picks",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "sql.js": "^1.12.0"
+  }
+}

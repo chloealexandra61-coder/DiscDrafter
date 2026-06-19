@@ -10,34 +10,6 @@ A Discord bot for leaving conditional draft picks privately (via DM), with publi
 
 ---
 
-## Setup
-
-### 1. Create a Discord Application
-1. Go to [discord.com/developers/applications](https://discord.com/developers/applications)
-2. New Application → give it a name
-3. Go to **Bot** tab → Reset Token → copy your token
-4. Under **Privileged Gateway Intents**, enable **Message Content Intent**
-5. Go to **OAuth2 → URL Generator**:
-   - Scopes: `bot`, `applications.commands`
-   - Bot permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`, `Read Message History`
-   - Copy the generated URL and invite the bot to your server
-
-### 2. Get your Client ID
-In your application's **General Information** tab, copy the **Application ID**.
-
-### 3. Install and run
-```bash
-npm install
-
-export DISCORD_TOKEN=your_token_here
-export CLIENT_ID=your_client_id_here
-
-node bot.js
-```
-
-Optional `.env` support — install dotenv and add `require('dotenv').config()` to the top of `bot.js`.
-
----
 
 ## Commands
 

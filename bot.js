@@ -402,7 +402,7 @@ function buildConditionEmbed(targetUser, round, queue, index) {
     .setTitle(`📋 Evaluating picks for ${targetUser.username} — Round ${round}`)
     .setDescription(
       `**Condition:** ${entry.condition}\n\n` +
-      `**If met, pick:** ${entry.pick}\n\n` +
+      `*The pick will be revealed once the condition is confirmed met.*\n\n` +
       `Use \`/condition result:met\` or \`/condition result:not met\` to continue.`
     )
     .setFooter({ text: `Entry ${index + 1} of ${queue.length}` });
@@ -478,7 +478,7 @@ async function advanceEvaluation(interaction, conditionMet) {
       .setTitle(`⏭️ Condition not met — trying next pick`)
       .setDescription(
         `**Condition:** ${nextEntry.condition}\n\n` +
-        `**If met, pick:** ${nextEntry.pick}\n\n` +
+        `*The pick will be revealed once the condition is confirmed met.*\n\n` +
         `Use \`/condition result:met\` or \`/condition result:not met\` to continue.`
       )
       .setFooter({ text: `Entry ${nextIndex + 1} of ${queue.length} • Round ${round} • ${targetUser.username}` })],

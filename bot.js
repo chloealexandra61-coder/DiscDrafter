@@ -209,6 +209,11 @@ function dbGetAllTeams(guildId) {
   return rows;
 }
 
+function dbRemoveDrafted(guildId, userId, round) {
+  db.run('DELETE FROM drafted WHERE guild_id = ? AND user_id = ? AND round = ?', [guildId, userId, round]);
+  saveDb();
+}
+
 // ─── Draft order DB helpers ────────────────────────────────────────────────
 
 function dbGetOrder(guildId) {
@@ -285,7 +290,7 @@ function dbAdvanceTurn(guildId) {
 // Server commands: evaluate, condition, draftorder, whosturn, nextturn
 
 const DM_COMMANDS = new Set(['addpick', 'mypicks', 'clearpicks', 'insertpick', 'removepick']);
-const SERVER_COMMANDS = new Set(['evaluate', 'condition', 'confirmpick', 'draftorder', 'whosturn', 'nextturn', 'teams', 'myteam', 'resetdraft']);
+const SERVER_COMMANDS = new Set(['evaluate', 'condition', 'confirmpick', 'pick', 'draftorder', 'whosturn', 'nextturn', 'teams', 'myteam', 'addteampick', 'removeteampick', 'resetdraft']);
 
 const commands = [
   // ── DM commands ──────────────────────────────────────────────────────────
@@ -365,6 +370,16 @@ const commands = [
         )),
 
   new SlashCommandBuilder()
+    .setName('pick')
+    .setDescription('(Server only) Directly make a pick for whoever\'s turn it is — skips the condition queue')
+    .addStringOption(o =>
+      o.setName('pokemon').setDescription('What to pick').setRequired(true))
+    .addUserOption(o =>
+      o.setName('player').setDescription('Player to pick for (leave blank to use the current turn)').setRequired(false))
+    .addIntegerOption(o =>
+      o.setName('round').setDescription('Round number (leave blank to use the current round)').setRequired(false)),
+
+  new SlashCommandBuilder()
     .setName('draftorder')
     .setDescription('(Server only) Set or view the draft pick order')
     .addStringOption(o =>
@@ -389,6 +404,26 @@ const commands = [
     .setDescription('(Server only) Show a specific player\'s drafted picks so far')
     .addUserOption(o =>
       o.setName('player').setDescription('Player to look up (leave blank for yourself)').setRequired(false)),
+
+  new SlashCommandBuilder()
+    .setName('addteampick')
+    .setDescription('(Server only, admin) Manually add or overwrite a pick on a player\'s team')
+    .setDefaultMemberPermissions(0) // Administrator-only by default
+    .addUserOption(o =>
+      o.setName('player').setDescription('Player whose team to update').setRequired(true))
+    .addIntegerOption(o =>
+      o.setName('round').setDescription('Round number').setRequired(true).setMinValue(1))
+    .addStringOption(o =>
+      o.setName('pick').setDescription('What they picked').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('removeteampick')
+    .setDescription('(Server only, admin) Remove a pick from a player\'s team for a given round')
+    .setDefaultMemberPermissions(0) // Administrator-only by default
+    .addUserOption(o =>
+      o.setName('player').setDescription('Player whose team to update').setRequired(true))
+    .addIntegerOption(o =>
+      o.setName('round').setDescription('Round number to clear').setRequired(true).setMinValue(1)),
 
   new SlashCommandBuilder()
     .setName('resetdraft')
@@ -798,6 +833,54 @@ client.on('interactionCreate', async interaction => {
       return confirmPendingPick(interaction, result === 'yes');
     }
 
+    // ── /pick ─────────────────────────────────────────────────────────────────
+    if (commandName === 'pick') {
+      const pokemon = interaction.options.getString('pokemon');
+      let targetUser = interaction.options.getUser('player');
+      let round = interaction.options.getInteger('round');
+
+      const state = dbGetState(guildId);
+      const order = dbGetOrder(guildId);
+
+      // Fall back to current turn from draft order if not specified
+      if (!targetUser || !round) {
+        if (!state || order.length === 0) {
+          return interaction.reply({
+            content: 'No draft order set. Specify `player` and `round` manually, or set one up with `/draftorder`.',
+            ephemeral: true,
+          });
+        }
+        if (!round) round = state.current_round;
+        if (!targetUser) targetUser = await client.users.fetch(order[state.current_pos].user_id);
+      }
+
+      // Permission check: only the player themself or an admin can pick for someone
+      const isSelf = targetUser.id === user.id;
+      const isAdmin = interaction.memberPermissions?.has('Administrator');
+      if (!isSelf && !isAdmin) {
+        return interaction.reply({
+          content: `Only **${targetUser.username}** or a server admin can make this pick.`,
+          ephemeral: true,
+        });
+      }
+
+      dbClearRoundQueue(targetUser.id, round);
+      dbAddDrafted(guildId, targetUser.id, round, pokemon);
+      delete evaluations[interaction.channelId];
+
+      await interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(0x57F287)
+          .setTitle(`✅ Pick made — Round ${round}`)
+          .setDescription(
+            `**${targetUser.username}** drafts **${pokemon}**!\n\n` +
+            `Any queued backup picks for round ${round} have been cleared.`
+          )],
+      });
+
+      return announceNextTurn(interaction);
+    }
+
     // ── /draftorder ───────────────────────────────────────────────────────────
     if (commandName === 'draftorder') {
       const playersStr = interaction.options.getString('players');
@@ -935,6 +1018,49 @@ client.on('interactionCreate', async interaction => {
       }
 
       return interaction.reply({ embeds: [embed] });
+    }
+
+    // ── /addteampick ──────────────────────────────────────────────────────────
+    if (commandName === 'addteampick') {
+      const targetUser = interaction.options.getUser('player');
+      const round = interaction.options.getInteger('round');
+      const pick = interaction.options.getString('pick');
+
+      const existing = dbGetTeam(guildId, targetUser.id).find(r => r.round === round);
+      dbAddDrafted(guildId, targetUser.id, round, pick);
+
+      return interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(0x57F287)
+          .setTitle(existing ? '✏️ Team pick updated' : '✅ Team pick added')
+          .setDescription(
+            existing
+              ? `**${targetUser.username}**'s round ${round} pick changed from **${existing.pick}** to **${pick}**.`
+              : `**${targetUser.username}** now has **${pick}** for round ${round}.`
+          )],
+      });
+    }
+
+    // ── /removeteampick ───────────────────────────────────────────────────────
+    if (commandName === 'removeteampick') {
+      const targetUser = interaction.options.getUser('player');
+      const round = interaction.options.getInteger('round');
+
+      const existing = dbGetTeam(guildId, targetUser.id).find(r => r.round === round);
+      if (!existing) {
+        return interaction.reply({
+          content: `**${targetUser.username}** has no pick recorded for round ${round}.`,
+          ephemeral: true,
+        });
+      }
+
+      dbRemoveDrafted(guildId, targetUser.id, round);
+      return interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(0xFF6B6B)
+          .setTitle('🗑️ Team pick removed')
+          .setDescription(`Removed **${existing.pick}** from **${targetUser.username}**'s round ${round}.`)],
+      });
     }
 
     // ── /resetdraft ───────────────────────────────────────────────────────────

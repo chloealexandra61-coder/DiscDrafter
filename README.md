@@ -34,6 +34,7 @@ Picks are evaluated top-to-bottom. The first one whose condition is met executes
 | `/evaluate [player:@user] [round:<n>]` | Evaluate a player's pick queue |
 | `/condition result:met\|not met` | Report if the current condition is met |
 | `/nextturn` | Advance to the next player's turn |
+| `/resetdraft confirm:true` | **Admin only.** Wipes the draft order, turn pointer, and all queued picks for this draft |
 
 `/evaluate` with no arguments uses the current player from the draft order. `/nextturn` advances the pointer and announces who's up next (auto-increments the round when the order wraps).
 
@@ -85,3 +86,4 @@ Picks are evaluated top-to-bottom. The first one whose condition is met executes
 - One active evaluation per server channel at a time
 - If `/evaluate` shows an unconditional pick, it resolves immediately without needing `/condition`
 - If all conditions fail, the bot warns and the player picks manually
+- `/resetdraft` requires Administrator permission by default. Run it once with `confirm:false` (or omit) to see the warning, then `confirm:true` to actually wipe everything — this deletes the draft order, the turn pointer, and every queued pick for players in that order. It does not touch picks for players not currently in a draft order (e.g. if they're queuing for a future draft).

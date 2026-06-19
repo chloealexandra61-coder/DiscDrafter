@@ -148,6 +148,16 @@ function dbClearRoundQueue(userId, round) {
   saveDb();
 }
 
+function dbResetGuild(guildId, order) {
+  // Wipe picks for everyone currently in the draft order, plus the order/state itself
+  for (const row of order) {
+    db.run('DELETE FROM picks WHERE user_id = ?', [row.user_id]);
+  }
+  db.run('DELETE FROM draft_order WHERE guild_id = ?', [guildId]);
+  db.run('DELETE FROM draft_state WHERE guild_id = ?', [guildId]);
+  saveDb();
+}
+
 // ─── Draft order DB helpers ────────────────────────────────────────────────
 
 function dbGetOrder(guildId) {
@@ -215,7 +225,7 @@ function dbAdvanceTurn(guildId) {
 // Server commands: evaluate, condition, draftorder, whosturn, nextturn
 
 const DM_COMMANDS = new Set(['addpick', 'mypicks', 'clearpicks', 'insertpick', 'removepick']);
-const SERVER_COMMANDS = new Set(['evaluate', 'condition', 'draftorder', 'whosturn', 'nextturn']);
+const SERVER_COMMANDS = new Set(['evaluate', 'condition', 'draftorder', 'whosturn', 'nextturn', 'resetdraft']);
 
 const commands = [
   // ── DM commands ──────────────────────────────────────────────────────────
@@ -297,6 +307,15 @@ const commands = [
   new SlashCommandBuilder()
     .setName('nextturn')
     .setDescription('(Server only) Advance to the next player\'s turn'),
+
+  new SlashCommandBuilder()
+    .setName('resetdraft')
+    .setDescription('(Server only, admin) Wipe the draft order and all queued picks for this server')
+    .setDefaultMemberPermissions(0) // Administrator-only by default; server admins can change this in Integrations settings
+    .addBooleanOption(o =>
+      o.setName('confirm')
+        .setDescription('Set to true to actually confirm the reset')
+        .setRequired(true)),
 
 ].map(c => c.toJSON());
 
@@ -715,6 +734,41 @@ client.on('interactionCreate', async interaction => {
             `It's now **${nextUser.username}**'s turn.\n` +
             `**Round:** ${next.round} • **Position:** ${next.pos + 1} of ${order.length}\n\n` +
             `Use \`/evaluate\` to process their queued picks.`
+          )],
+      });
+    }
+
+    // ── /resetdraft ───────────────────────────────────────────────────────────
+    if (commandName === 'resetdraft') {
+      const confirm = interaction.options.getBoolean('confirm');
+      const order = dbGetOrder(guildId);
+
+      if (!confirm) {
+        return interaction.reply({
+          content:
+            '⚠️ This will permanently delete the draft order, the current turn pointer, ' +
+            'and **all queued picks** for every player in this draft.\n\n' +
+            'Run `/resetdraft confirm:true` to actually do it.',
+          ephemeral: true,
+        });
+      }
+
+      if (order.length === 0) {
+        return interaction.reply({
+          content: 'Nothing to reset — no draft order is set for this server.',
+          ephemeral: true,
+        });
+      }
+
+      dbResetGuild(guildId, order);
+
+      return interaction.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(0xFF6B6B)
+          .setTitle('🗑️ Draft reset')
+          .setDescription(
+            'The draft order, turn pointer, and all queued picks for this draft have been wiped.\n\n' +
+            'Use `/draftorder` to start a new one.'
           )],
       });
     }

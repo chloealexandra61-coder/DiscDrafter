@@ -62,6 +62,16 @@ async function initDb() {
     )
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS drafted (
+      guild_id  TEXT NOT NULL,
+      user_id   TEXT NOT NULL,
+      round     INTEGER NOT NULL,
+      pick      TEXT NOT NULL,
+      PRIMARY KEY (guild_id, user_id, round)
+    )
+  `);
+
   // Migration for DBs created before snake-draft support existed
   try {
     db.run('ALTER TABLE draft_state ADD COLUMN direction INTEGER NOT NULL DEFAULT 1');
@@ -163,7 +173,40 @@ function dbResetGuild(guildId, order) {
   }
   db.run('DELETE FROM draft_order WHERE guild_id = ?', [guildId]);
   db.run('DELETE FROM draft_state WHERE guild_id = ?', [guildId]);
+  db.run('DELETE FROM drafted WHERE guild_id = ?', [guildId]);
   saveDb();
+}
+
+// ─── Drafted roster DB helpers ─────────────────────────────────────────────
+
+function dbAddDrafted(guildId, userId, round, pick) {
+  db.run(
+    'INSERT OR REPLACE INTO drafted (guild_id, user_id, round, pick) VALUES (?, ?, ?, ?)',
+    [guildId, userId, round, pick]
+  );
+  saveDb();
+}
+
+function dbGetTeam(guildId, userId) {
+  const stmt = db.prepare(
+    'SELECT round, pick FROM drafted WHERE guild_id = ? AND user_id = ? ORDER BY round'
+  );
+  stmt.bind([guildId, userId]);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+
+function dbGetAllTeams(guildId) {
+  const stmt = db.prepare(
+    'SELECT user_id, round, pick FROM drafted WHERE guild_id = ? ORDER BY user_id, round'
+  );
+  stmt.bind([guildId]);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
 }
 
 // ─── Draft order DB helpers ────────────────────────────────────────────────
@@ -242,7 +285,7 @@ function dbAdvanceTurn(guildId) {
 // Server commands: evaluate, condition, draftorder, whosturn, nextturn
 
 const DM_COMMANDS = new Set(['addpick', 'mypicks', 'clearpicks', 'insertpick', 'removepick']);
-const SERVER_COMMANDS = new Set(['evaluate', 'condition', 'draftorder', 'whosturn', 'nextturn', 'resetdraft']);
+const SERVER_COMMANDS = new Set(['evaluate', 'condition', 'confirmpick', 'draftorder', 'whosturn', 'nextturn', 'teams', 'myteam', 'resetdraft']);
 
 const commands = [
   // ── DM commands ──────────────────────────────────────────────────────────
@@ -310,6 +353,18 @@ const commands = [
         )),
 
   new SlashCommandBuilder()
+    .setName('confirmpick')
+    .setDescription('(Server only) Confirm or reject the pending pick')
+    .addStringOption(o =>
+      o.setName('result')
+        .setDescription('Lock in the pick, or reject and move to the next backup?')
+        .setRequired(true)
+        .addChoices(
+          { name: 'yes', value: 'yes' },
+          { name: 'no', value: 'no' }
+        )),
+
+  new SlashCommandBuilder()
     .setName('draftorder')
     .setDescription('(Server only) Set or view the draft pick order')
     .addStringOption(o =>
@@ -324,6 +379,16 @@ const commands = [
   new SlashCommandBuilder()
     .setName('nextturn')
     .setDescription('(Server only) Advance to the next player\'s turn'),
+
+  new SlashCommandBuilder()
+    .setName('teams')
+    .setDescription('(Server only) Show everyone\'s drafted picks so far'),
+
+  new SlashCommandBuilder()
+    .setName('myteam')
+    .setDescription('(Server only) Show a specific player\'s drafted picks so far')
+    .addUserOption(o =>
+      o.setName('player').setDescription('Player to look up (leave blank for yourself)').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('resetdraft')
@@ -384,7 +449,9 @@ async function formatOrderEmbed(guildId) {
 
 // ─── Evaluation logic ──────────────────────────────────────────────────────
 
-// evaluations[channelId] = { userId, round, index }
+// evaluations[channelId] = { userId, round, index, pendingPick } 
+// pendingPick is set once a condition is met (or unconditional) and we're
+// waiting on /confirmpick to actually lock it in.
 const evaluations = {};
 
 async function startEvaluation(interaction, targetUser, round) {
@@ -401,12 +468,12 @@ async function startEvaluation(interaction, targetUser, round) {
     });
   }
 
-  evaluations[channelId] = { userId, round, index: 0 };
+  evaluations[channelId] = { userId, round, index: 0, pendingPick: null };
 
   const firstEntry = queue[0];
-  // If first entry is unconditional, resolve immediately
+  // If first entry is unconditional, go straight to pending confirmation
   if (!firstEntry.condition) {
-    return resolveUnconditional(interaction, targetUser, round, firstEntry.pick, queue.length);
+    return presentPendingPick(interaction, targetUser, round, firstEntry.pick, queue.length);
   }
 
   return interaction.reply({ embeds: [buildConditionEmbed(targetUser, round, queue, 0)] });
@@ -425,19 +492,115 @@ function buildConditionEmbed(targetUser, round, queue, index) {
     .setFooter({ text: `Entry ${index + 1} of ${queue.length}` });
 }
 
-async function resolveUnconditional(interaction, targetUser, round, pickedItem, totalEntries) {
-  delete evaluations[interaction.channelId];
-  dbClearRoundQueue(targetUser.id, round);
-  await interaction.reply({
+// Shows the pick as pending and waits for /confirmpick to lock it in.
+// Does NOT clear the queue or touch turn order yet.
+async function presentPendingPick(interaction, targetUser, round, pickedItem, totalEntries) {
+  const channelId = interaction.channelId;
+  evaluations[channelId].pendingPick = pickedItem;
+
+  return interaction.reply({
     embeds: [new EmbedBuilder()
-      .setColor(0x57F287)
-      .setTitle(`✅ Pick confirmed${totalEntries > 1 ? ' (unconditional fallback)' : ''} — Round ${round}`)
+      .setColor(0xFEE75C)
+      .setTitle(`🕐 Pending confirmation — Round ${round}`)
       .setDescription(
-        `**${targetUser.username}** picks: **${pickedItem}**\n\n` +
-        `Their round ${round} queue has been cleared.`
+        `**${targetUser.username}** would like to pick **${pickedItem}**.\n\n` +
+        `Use \`/confirmpick result:yes\` to lock it in, or \`/confirmpick result:no\` to move to the next backup.`
       )],
   });
-  return announceNextTurn(interaction);
+}
+
+async function advanceEvaluation(interaction, conditionMet) {
+  const channelId = interaction.channelId;
+  const eval_ = evaluations[channelId];
+  if (!eval_) {
+    return interaction.reply({ content: 'No active evaluation in this channel.', ephemeral: true });
+  }
+
+  const { userId, round, index } = eval_;
+  const queue = dbGetPicks(userId, round);
+  const entry = queue[index];
+  const targetUser = await client.users.fetch(userId);
+
+  if (conditionMet) {
+    return presentPendingPick(interaction, targetUser, round, entry.pick, queue.length);
+  }
+
+  // Not met — advance to next backup
+  const nextIndex = index + 1;
+
+  if (nextIndex >= queue.length) {
+    delete evaluations[channelId];
+    return interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(0xFF6B6B)
+        .setTitle(`⚠️ No valid pick found — Round ${round}`)
+        .setDescription(
+          `**${targetUser.username}**'s queue is exhausted — all conditions were unmet.\n` +
+          `They'll need to pick manually.`
+        )],
+    });
+  }
+
+  evaluations[channelId].index = nextIndex;
+  const nextEntry = queue[nextIndex];
+
+  // Next is unconditional — go straight to pending confirmation
+  if (!nextEntry.condition) {
+    return presentPendingPick(interaction, targetUser, round, nextEntry.pick, queue.length);
+  }
+
+  return interaction.reply({
+    embeds: [new EmbedBuilder()
+      .setColor(0xFEE75C)
+      .setTitle(`⏭️ Condition not met — trying next pick`)
+      .setDescription(
+        `**Condition:** ${nextEntry.condition}\n\n` +
+        `*The pick will be revealed once the condition is confirmed met.*\n\n` +
+        `Use \`/condition result:met\` or \`/condition result:not met\` to continue.`
+      )
+      .setFooter({ text: `Entry ${nextIndex + 1} of ${queue.length} • Round ${round} • ${targetUser.username}` })],
+  });
+}
+
+// Final confirmation step — locks the pending pick in (clears queue, records
+// to the team roster, and auto-advances the turn) or rejects it (treats the
+// pending entry as failed and cascades to the next backup pick).
+async function confirmPendingPick(interaction, confirmed) {
+  const channelId = interaction.channelId;
+  const guildId = interaction.guildId;
+  const eval_ = evaluations[channelId];
+
+  if (!eval_ || !eval_.pendingPick) {
+    return interaction.reply({
+      content: 'No pick is currently pending confirmation in this channel.',
+      ephemeral: true,
+    });
+  }
+
+  const { userId, round, pendingPick } = eval_;
+  const targetUser = await client.users.fetch(userId);
+
+  if (confirmed) {
+    dbClearRoundQueue(userId, round);
+    dbAddDrafted(guildId, userId, round, pendingPick);
+    delete evaluations[channelId];
+
+    await interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(0x57F287)
+        .setTitle(`✅ Pick locked in — Round ${round}`)
+        .setDescription(
+          `**${targetUser.username}** drafts **${pendingPick}**!\n\n` +
+          `Their round ${round} queue has been cleared.`
+        )],
+    });
+
+    return announceNextTurn(interaction);
+  }
+
+  // Rejected — treat current pending entry as a failure and cascade to next backup
+  eval_.pendingPick = null;
+  return advanceEvaluation(interaction, false);
 }
 
 // Advances the draft order pointer (if one is set for this guild) and pings
@@ -466,70 +629,6 @@ async function announceNextTurn(interaction) {
         `**Round:** ${next.round} • **Position:** ${next.pos + 1} of ${order.length}\n\n` +
         `Run \`/evaluate\` when ready to process their queued picks.`
       )],
-  });
-}
-
-async function advanceEvaluation(interaction, conditionMet) {
-  const channelId = interaction.channelId;
-  const eval_ = evaluations[channelId];
-  if (!eval_) {
-    return interaction.reply({ content: 'No active evaluation in this channel.', ephemeral: true });
-  }
-
-  const { userId, round, index } = eval_;
-  const queue = dbGetPicks(userId, round);
-  const entry = queue[index];
-  const targetUser = await client.users.fetch(userId);
-
-  if (conditionMet) {
-    dbClearRoundQueue(userId, round);
-    delete evaluations[channelId];
-    await interaction.reply({
-      embeds: [new EmbedBuilder()
-        .setColor(0x57F287)
-        .setTitle(`✅ Pick confirmed — Round ${round}`)
-        .setDescription(
-          `**${targetUser.username}** picks: **${entry.pick}**\n\n` +
-          `Their round ${round} queue has been cleared.`
-        )],
-    });
-    return announceNextTurn(interaction);
-  }
-
-  // Not met — advance
-  const nextIndex = index + 1;
-
-  if (nextIndex >= queue.length) {
-    delete evaluations[channelId];
-    return interaction.reply({
-      embeds: [new EmbedBuilder()
-        .setColor(0xFF6B6B)
-        .setTitle(`⚠️ No valid pick found — Round ${round}`)
-        .setDescription(
-          `**${targetUser.username}**'s queue is exhausted — all conditions were unmet.\n` +
-          `They'll need to pick manually.`
-        )],
-    });
-  }
-
-  evaluations[channelId].index = nextIndex;
-  const nextEntry = queue[nextIndex];
-
-  // Next is unconditional — resolve immediately
-  if (!nextEntry.condition) {
-    return resolveUnconditional(interaction, targetUser, round, nextEntry.pick, queue.length);
-  }
-
-  return interaction.reply({
-    embeds: [new EmbedBuilder()
-      .setColor(0xFEE75C)
-      .setTitle(`⏭️ Condition not met — trying next pick`)
-      .setDescription(
-        `**Condition:** ${nextEntry.condition}\n\n` +
-        `*The pick will be revealed once the condition is confirmed met.*\n\n` +
-        `Use \`/condition result:met\` or \`/condition result:not met\` to continue.`
-      )
-      .setFooter({ text: `Entry ${nextIndex + 1} of ${queue.length} • Round ${round} • ${targetUser.username}` })],
   });
 }
 
@@ -693,6 +792,12 @@ client.on('interactionCreate', async interaction => {
       return advanceEvaluation(interaction, result === 'met');
     }
 
+    // ── /confirmpick ──────────────────────────────────────────────────────────
+    if (commandName === 'confirmpick') {
+      const result = interaction.options.getString('result');
+      return confirmPendingPick(interaction, result === 'yes');
+    }
+
     // ── /draftorder ───────────────────────────────────────────────────────────
     if (commandName === 'draftorder') {
       const playersStr = interaction.options.getString('players');
@@ -786,6 +891,50 @@ client.on('interactionCreate', async interaction => {
             `Run \`/evaluate\` when ready to process their queued picks.`
           )],
       });
+    }
+
+    // ── /teams ────────────────────────────────────────────────────────────────
+    if (commandName === 'teams') {
+      const rows = dbGetAllTeams(guildId);
+
+      if (rows.length === 0) {
+        return interaction.reply({ content: 'No picks have been drafted yet.' });
+      }
+
+      const byUser = {};
+      for (const row of rows) {
+        if (!byUser[row.user_id]) byUser[row.user_id] = [];
+        byUser[row.user_id].push(row);
+      }
+
+      const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🏆 Current Teams');
+
+      for (const uid of Object.keys(byUser)) {
+        const u = await client.users.fetch(uid).catch(() => ({ username: uid }));
+        const lines = byUser[uid]
+          .sort((a, b) => a.round - b.round)
+          .map(r => `R${r.round}: **${r.pick}**`)
+          .join('\n');
+        embed.addFields({ name: u.username, value: lines, inline: true });
+      }
+
+      return interaction.reply({ embeds: [embed] });
+    }
+
+    // ── /myteam ───────────────────────────────────────────────────────────────
+    if (commandName === 'myteam') {
+      const targetUser = interaction.options.getUser('player') || user;
+      const rows = dbGetTeam(guildId, targetUser.id);
+
+      const embed = new EmbedBuilder().setColor(0x5865F2).setTitle(`🏆 ${targetUser.username}'s team`);
+
+      if (rows.length === 0) {
+        embed.setDescription('No picks drafted yet.');
+      } else {
+        embed.setDescription(rows.map(r => `**Round ${r.round}:** ${r.pick}`).join('\n'));
+      }
+
+      return interaction.reply({ embeds: [embed] });
     }
 
     // ── /resetdraft ───────────────────────────────────────────────────────────

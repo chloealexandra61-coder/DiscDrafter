@@ -57,9 +57,17 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS draft_state (
       guild_id      TEXT PRIMARY KEY,
       current_round INTEGER NOT NULL DEFAULT 1,
-      current_pos   INTEGER NOT NULL DEFAULT 0
+      current_pos   INTEGER NOT NULL DEFAULT 0,
+      direction     INTEGER NOT NULL DEFAULT 1
     )
   `);
+
+  // Migration for DBs created before snake-draft support existed
+  try {
+    db.run('ALTER TABLE draft_state ADD COLUMN direction INTEGER NOT NULL DEFAULT 1');
+  } catch (e) {
+    // Column already exists — fine, ignore.
+  }
 
   saveDb();
 }
@@ -179,16 +187,16 @@ function dbSetOrder(guildId, userIds) {
       [guildId, i, uid]
     );
   });
-  // Reset state
+  // Reset state — round 1, position 0, forward direction
   db.run(
-    'INSERT OR REPLACE INTO draft_state (guild_id, current_round, current_pos) VALUES (?, 1, 0)',
+    'INSERT OR REPLACE INTO draft_state (guild_id, current_round, current_pos, direction) VALUES (?, 1, 0, 1)',
     [guildId]
   );
   saveDb();
 }
 
 function dbGetState(guildId) {
-  const stmt = db.prepare('SELECT current_round, current_pos FROM draft_state WHERE guild_id = ?');
+  const stmt = db.prepare('SELECT current_round, current_pos, direction FROM draft_state WHERE guild_id = ?');
   stmt.bind([guildId]);
   if (stmt.step()) {
     const row = stmt.getAsObject();
@@ -204,17 +212,26 @@ function dbAdvanceTurn(guildId) {
   const state = dbGetState(guildId);
   if (!order.length || !state) return null;
 
-  let nextPos = state.current_pos + 1;
+  const n = order.length;
+  let nextPos = state.current_pos + state.direction;
   let nextRound = state.current_round;
+  let nextDirection = state.direction;
 
-  if (nextPos >= order.length) {
+  if (nextPos >= n) {
+    // Hit the end going forward — bounce back, same player goes again next round (snake)
+    nextDirection = -1;
+    nextPos = n - 1;
+    nextRound += 1;
+  } else if (nextPos < 0) {
+    // Hit the start going backward — bounce forward
+    nextDirection = 1;
     nextPos = 0;
     nextRound += 1;
   }
 
   db.run(
-    'UPDATE draft_state SET current_round = ?, current_pos = ? WHERE guild_id = ?',
-    [nextRound, nextPos, guildId]
+    'UPDATE draft_state SET current_round = ?, current_pos = ?, direction = ? WHERE guild_id = ?',
+    [nextRound, nextPos, nextDirection, guildId]
   );
   saveDb();
   return { round: nextRound, pos: nextPos, userId: order[nextPos].user_id };

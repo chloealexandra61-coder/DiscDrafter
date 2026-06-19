@@ -411,13 +411,43 @@ function buildConditionEmbed(targetUser, round, queue, index) {
 async function resolveUnconditional(interaction, targetUser, round, pickedItem, totalEntries) {
   delete evaluations[interaction.channelId];
   dbClearRoundQueue(targetUser.id, round);
-  return interaction.reply({
+  await interaction.reply({
     embeds: [new EmbedBuilder()
       .setColor(0x57F287)
       .setTitle(`✅ Pick confirmed${totalEntries > 1 ? ' (unconditional fallback)' : ''} — Round ${round}`)
       .setDescription(
         `**${targetUser.username}** picks: **${pickedItem}**\n\n` +
         `Their round ${round} queue has been cleared.`
+      )],
+  });
+  return announceNextTurn(interaction);
+}
+
+// Advances the draft order pointer (if one is set for this guild) and pings
+// the next player in the channel. Safe to call even if no draft order exists.
+async function announceNextTurn(interaction) {
+  const guildId = interaction.guildId;
+  if (!guildId) return;
+
+  const order = dbGetOrder(guildId);
+  if (order.length === 0) return; // no draft order configured, nothing to announce
+
+  const next = dbAdvanceTurn(guildId);
+  if (!next) return;
+
+  const nextUser = await client.users.fetch(next.userId).catch(() => null);
+  const mention = nextUser ? `<@${next.userId}>` : `(user ${next.userId})`;
+  const isNewRound = next.pos === 0;
+
+  return interaction.followUp({
+    content: mention,
+    embeds: [new EmbedBuilder()
+      .setColor(isNewRound ? 0xFEE75C : 0x5865F2)
+      .setTitle(isNewRound ? `🔄 Round ${next.round} begins!` : `🎯 It's your turn`)
+      .setDescription(
+        `${mention} you're up.\n` +
+        `**Round:** ${next.round} • **Position:** ${next.pos + 1} of ${order.length}\n\n` +
+        `Run \`/evaluate\` when ready to process their queued picks.`
       )],
   });
 }
@@ -437,7 +467,7 @@ async function advanceEvaluation(interaction, conditionMet) {
   if (conditionMet) {
     dbClearRoundQueue(userId, round);
     delete evaluations[channelId];
-    return interaction.reply({
+    await interaction.reply({
       embeds: [new EmbedBuilder()
         .setColor(0x57F287)
         .setTitle(`✅ Pick confirmed — Round ${round}`)
@@ -446,6 +476,7 @@ async function advanceEvaluation(interaction, conditionMet) {
           `Their round ${round} queue has been cleared.`
         )],
     });
+    return announceNextTurn(interaction);
   }
 
   // Not met — advance
@@ -723,17 +754,19 @@ client.on('interactionCreate', async interaction => {
       }
 
       const next = dbAdvanceTurn(guildId);
-      const nextUser = await client.users.fetch(next.userId).catch(() => ({ username: next.userId }));
+      const nextUser = await client.users.fetch(next.userId).catch(() => null);
+      const mention = nextUser ? `<@${next.userId}>` : `(user ${next.userId})`;
       const isNewRound = next.pos === 0;
 
       return interaction.reply({
+        content: mention,
         embeds: [new EmbedBuilder()
           .setColor(isNewRound ? 0xFEE75C : 0x5865F2)
-          .setTitle(isNewRound ? `🔄 Round ${next.round} begins!` : `⏭️ Next pick`)
+          .setTitle(isNewRound ? `🔄 Round ${next.round} begins!` : `🎯 It's your turn`)
           .setDescription(
-            `It's now **${nextUser.username}**'s turn.\n` +
+            `${mention} you're up.\n` +
             `**Round:** ${next.round} • **Position:** ${next.pos + 1} of ${order.length}\n\n` +
-            `Use \`/evaluate\` to process their queued picks.`
+            `Run \`/evaluate\` when ready to process their queued picks.`
           )],
       });
     }
